@@ -1,0 +1,45 @@
+{
+  "name": "harness-model-router",
+  "version": "0.1.0",
+  "description": "Local protocol-preserving subagent model router for Claude Code and Codex",
+  "type": "module",
+  "bin": {
+    "harness-model-router": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "lint": "eslint . --max-warnings=0",
+    "start": "node dist/cli.js start",
+    "test": "vitest run",
+    "test:bridge": "npm run build && HMR_LIVE_DEVIN_BRIDGE=1 vitest run test/live-devin-bridge.test.ts",
+    "test:live": "npm run test:live-codex && npm run test:live-claude",
+    "test:live-claude": "HMR_LIVE_CLAUDE=1 vitest run test/live-claude.test.ts",
+    "test:live-codex": "HMR_LIVE_CODEX=1 vitest run test/live-codex.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1",
+    "smol-toml": "^1.4.2",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.10.1",
+    "eslint": "^9.39.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1",
+    "vitest": "^4.0.15"
+  }
+}

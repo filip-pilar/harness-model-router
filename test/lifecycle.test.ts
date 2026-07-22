@@ -1,0 +1,82 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+import { installIntegration, uninstallIntegration } from "../src/lifecycle.js";
+import { loadConfig, saveConfig } from "../src/config.js";
+import { temporaryRoot, testConfig, writeJson } from "./helpers.js";
+
+describe("installation lifecycle", () => {
+  it("installs idempotently, preserves unrelated state, normalizes explicit agents, and restores exactly", async () => {
+    const root = await temporaryRoot();
+    const home = resolve(root, "home");
+    const project = resolve(root, "project");
+    await mkdir(resolve(home, ".claude"), { recursive: true });
+    await mkdir(resolve(home, ".codex/agents"), { recursive: true });
+    await mkdir(project, { recursive: true });
+    const claudeSettings = resolve(home, ".claude/settings.json");
+    await writeJson(claudeSettings, { theme: "dark", hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "keep-me" }] }] } });
+    const source = resolve(root, "catalog.json");
+    await writeJson(source, { models: [{ slug: "parent", display_name: "Parent", multi_agent_version: "v2" }, { slug: "wire-review", display_name: "Review", multi_agent_version: "v2" }] });
+    const codexConfig = resolve(home, ".codex/config.toml");
+    const originalCodex = `model = "parent"\nmodel_provider = "private"\nmodel_catalog_json = ${JSON.stringify(source)}\nunrelated = "keep"\n\n[model_providers.private]\nbase_url = "http://original.example/v1"\nenv_key = "PRIVATE_API_KEY"\n`;
+    await writeFile(codexConfig, originalCodex);
+    const agentPath = resolve(home, ".codex/agents/reviewer.toml");
+    const originalAgent = 'name = "reviewer"\ndescription = "Review"\ndeveloper_instructions = "Be exact"\nmodel = "original-child"\n';
+    await writeFile(agentPath, originalAgent);
+    const { config, path } = await testConfig(root);
+    config.harnesses.claude.enabled = true;
+    config.harnesses.codex.enabled = true;
+    config.harnesses.codex.parentModels = ["parent"];
+    config.routes.codex.reviewer = { enabled: true, alias: "router-reviewer", model: "wire-review", upstream: { baseUrl: "http://custom.example/v1", protocol: "openai-responses" }, requiredMultiAgentVersion: "v1" };
+    await saveConfig(path, config);
+
+    const options = { home, project, cliPath: "/opt/router/cli.js", nodePath: "/opt/node" };
+    expect((await installIntegration(path, options)).conflicts).toEqual([]);
+    expect((await installIntegration(path, options)).conflicts).toEqual([]);
+    const settings = JSON.parse(await readFile(claudeSettings, "utf8"));
+    expect(settings.theme).toBe("dark");
+    expect(settings.hooks.PreToolUse[0].hooks[0].command).toBe("keep-me");
+    expect(settings.hooks.SubagentStart).toHaveLength(1);
+    expect(await readFile(agentPath, "utf8")).toContain('model = "router-reviewer"');
+    const installedConfig = await readFile(codexConfig, "utf8");
+    expect(installedConfig).toContain('unrelated = "keep"');
+    expect(installedConfig).toContain("[model_providers.harness-model-router]");
+    expect(installedConfig).toContain('env_key = "PRIVATE_API_KEY"');
+    const overlay = JSON.parse(await readFile((await loadConfig(path)).harnesses.codex.overlayCatalogPath!, "utf8"));
+    expect(overlay.models.find((model: any) => model.slug === "router-reviewer")).toMatchObject({ visibility: "hide", multi_agent_version: "v1" });
+    expect(overlay.models.find((model: any) => model.slug === "parent").multi_agent_version).toBe("v1");
+
+    const removed = await uninstallIntegration(path);
+    expect(removed.conflicts).toEqual([]);
+    expect(await readFile(agentPath, "utf8")).toBe(originalAgent);
+    const restoredSettings = JSON.parse(await readFile(claudeSettings, "utf8"));
+    expect(restoredSettings).toEqual({ theme: "dark", hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "keep-me" }] }] } });
+    const restoredConfig = await readFile(codexConfig, "utf8");
+    expect(restoredConfig).toContain('model_provider = "private"');
+    expect(restoredConfig).toContain('unrelated = "keep"');
+    expect(restoredConfig).not.toContain("harness-model-router:start");
+  });
+
+  it("detects later custom-agent edits and only force restores them explicitly", async () => {
+    const root = await temporaryRoot();
+    const home = resolve(root, "home");
+    const project = resolve(root, "project");
+    await mkdir(resolve(home, ".codex/agents"), { recursive: true });
+    await mkdir(project, { recursive: true });
+    const agentPath = resolve(home, ".codex/agents/reviewer.toml");
+    const original = 'name = "reviewer"\ndescription = "Review"\ndeveloper_instructions = "Review"\nmodel = "original"\n';
+    await writeFile(agentPath, original);
+    const { config, path } = await testConfig(root);
+    config.harnesses.codex.enabled = true;
+    const source = resolve(root, "catalog.json");
+    await writeJson(source, { models: [{ slug: "parent", display_name: "Parent" }] });
+    config.harnesses.codex.sourceCatalogPath = source;
+    config.routes.codex.reviewer = { enabled: true, alias: "router-reviewer", model: "real", upstream: { baseUrl: "http://custom/v1", protocol: "openai-responses" } };
+    await saveConfig(path, config);
+    await installIntegration(path, { home, project, cliPath: "/router.js", nodePath: "/node" });
+    await writeFile(agentPath, `${await readFile(agentPath, "utf8")}# user edit\n`);
+    expect((await uninstallIntegration(path)).conflicts.join("\n")).toMatch(/changed after normalization|changed after installation/);
+    await uninstallIntegration(path, true);
+    expect(await readFile(agentPath, "utf8")).toBe(`${original}# user edit\n`);
+  });
+});
