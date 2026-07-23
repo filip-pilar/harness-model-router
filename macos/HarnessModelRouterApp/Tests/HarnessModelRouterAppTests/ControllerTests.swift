@@ -55,7 +55,7 @@ private final class HelperStub: @unchecked Sendable {
     let stub = HelperStub { arguments in
         if arguments.contains("setup") { return ProcessResult(status: 1, stdout: #"{"error":"catalog capture failed"}"#, stderr: "", timedOut: false) }
         if arguments.contains("remove") || arguments.contains("reset") {
-            return ProcessResult(status: 0, stdout: #"{"changed":[],"conflicts":["owned configuration changed"]}"#, stderr: "", timedOut: false)
+            return ProcessResult(status: 0, stdout: #"{"changed":[],"conflicts":["owned configuration changed","custom agent changed"]}"#, stderr: "", timedOut: false)
         }
         return ProcessResult(status: 0, stdout: fixture.payload, stderr: "", timedOut: false)
     }
@@ -68,9 +68,33 @@ private final class HelperStub: @unchecked Sendable {
 
     await controller.removeOperation(.claude)
     #expect(controller.pendingForceHarness == .claude)
+    #expect(controller.pendingForceHarnessConflicts == ["owned configuration changed", "custom agent changed"])
     await controller.resetOperation()
     #expect(controller.pendingForceReset)
+    #expect(controller.pendingForceResetConflicts == ["owned configuration changed", "custom agent changed"])
     #expect(controller.feedback?.detail.contains("owned configuration changed") == true)
+}
+
+@MainActor
+@Test func discoveredModelsStayScopedToDestinationAndProtocol() async throws {
+    let fixture = try makeFixture()
+    let stub = HelperStub { arguments in
+        if arguments.contains("models") {
+            let models = arguments.contains("claude") ? #"{"reachable":true,"models":["claude-child"]}"# : #"{"reachable":true,"models":["codex-child"]}"#
+            return ProcessResult(status: 0, stdout: models, stderr: "", timedOut: false)
+        }
+        return ProcessResult(status: 0, stdout: fixture.payload, stderr: "", timedOut: false)
+    }
+    let controller = makeController(fixture: fixture, stub: stub)
+    await controller.bootstrap()
+
+    await controller.testModels(destination: "one", harness: .claude)
+    await controller.testModels(destination: "two", harness: .codex)
+
+    #expect(controller.models(destination: "one", harness: .claude) == ["claude-child"])
+    #expect(controller.models(destination: "one", harness: .codex).isEmpty)
+    #expect(controller.models(destination: "two", harness: .codex) == ["codex-child"])
+    #expect(controller.models(destination: "two", harness: .claude).isEmpty)
 }
 
 @Test func destinationAndRouteEditingRulesCoverInvalidAndDanglingState() throws {
@@ -94,6 +118,11 @@ private final class HelperStub: @unchecked Sendable {
 @Test func menuSymbolsExistOnTheDeploymentTarget() {
     #expect(NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: nil) != nil)
     #expect(NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil) != nil)
+}
+
+@MainActor
+@Test func usageGuidePointsAtTheRepositoryDocumentation() {
+    #expect(RouterController.usageGuideURL.absoluteString.hasSuffix("/docs/USING_THE_APP.md"))
 }
 
 private struct Fixture: @unchecked Sendable {

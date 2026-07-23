@@ -8,15 +8,20 @@ import ServiceManagement
 final class RouterController: ObservableObject {
     enum GatewayState: Equatable { case checking, starting, running, stopped, failed(String) }
     struct Feedback: Equatable { var title: String; var detail: String; var failure: Bool }
+    private struct ModelDiscoveryKey: Hashable { var destination: String; var harness: Harness }
+
+    static let usageGuideURL = URL(string: "https://github.com/filip-pilar/harness-model-router/blob/main/docs/USING_THE_APP.md")!
 
     @Published private(set) var gatewayState: GatewayState = .checking
     @Published private(set) var payload: AppStatePayload?
     @Published private(set) var feedback: Feedback?
     @Published private(set) var busy = false
-    @Published private(set) var discoveredModels: [String] = []
+    @Published private var discoveredModels: [ModelDiscoveryKey: [String]] = [:]
     @Published private(set) var destinationReachability: [String: DestinationReachability] = [:]
     @Published private(set) var pendingForceHarness: Harness?
+    @Published private(set) var pendingForceHarnessConflicts: [String] = []
     @Published private(set) var pendingForceReset = false
+    @Published private(set) var pendingForceResetConflicts: [String] = []
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     let paths: AppPaths
@@ -152,9 +157,11 @@ final class RouterController: ObservableObject {
             let lifecycle = try JSONDecoder().decode(LifecycleResult.self, from: Data(result.stdout.utf8))
             if !lifecycle.conflicts.isEmpty {
                 pendingForceHarness = harness
+                pendingForceHarnessConflicts = lifecycle.conflicts
                 recordFailure("Configuration changed after setup", lifecycle.conflicts.joined(separator: "\n"))
             } else {
                 pendingForceHarness = nil
+                pendingForceHarnessConflicts = []
                 try await refreshPayload()
                 feedback = Feedback(title: "\(harness.title) restored", detail: "Router-owned configuration was removed.", failure: false)
                 if !configured { await stopGateway() }
@@ -177,19 +184,24 @@ final class RouterController: ObservableObject {
     }
 
     func testModels(destination: String, harness: Harness) async {
-        discoveredModels = []
+        let key = ModelDiscoveryKey(destination: destination, harness: harness)
+        discoveredModels[key] = []
         destinationReachability[destination] = .checking
         do {
             let result = try await runHelper(["--config", paths.config.path, "models", destination, harness.rawValue, "--json"])
             guard result.status == 0 else { throw commandError(result) }
             let models = try JSONDecoder().decode(ModelsResult.self, from: Data(result.stdout.utf8))
-            discoveredModels = models.models
+            discoveredModels[key] = models.models
             destinationReachability[destination] = .reachable(modelCount: models.models.count)
             feedback = Feedback(title: "Destination is reachable", detail: models.models.isEmpty ? "No models were advertised; manual entry remains available." : "Found \(models.models.count) models.", failure: false)
         } catch {
             destinationReachability[destination] = .unreachable(error.localizedDescription)
             record(error, title: "Destination is currently unreachable")
         }
+    }
+
+    func models(destination: String, harness: Harness) -> [String] {
+        discoveredModels[ModelDiscoveryKey(destination: destination, harness: harness)] ?? []
     }
 
     func reset(force: Bool = false) { Task { await resetOperation(force: force) } }
@@ -201,9 +213,12 @@ final class RouterController: ObservableObject {
         catch { record(error, title: "Reset failed"); busy = false; return }
         guard result.status == 0 else { record(commandError(result), title: "Reset failed"); busy = false; return }
         if let lifecycle = try? JSONDecoder().decode(LifecycleResult.self, from: Data(result.stdout.utf8)), !lifecycle.conflicts.isEmpty {
-            pendingForceReset = true; recordFailure("Configuration changed after setup", lifecycle.conflicts.joined(separator: "\n")); busy = false; return
+            pendingForceReset = true
+            pendingForceResetConflicts = lifecycle.conflicts
+            recordFailure("Configuration changed after setup", "Open Manage → Advanced to review the reset conflicts.\n\n\(lifecycle.conflicts.joined(separator: "\n"))"); busy = false; return
         }
         pendingForceReset = false
+        pendingForceResetConflicts = []
         await stopGateway()
         if SMAppService.mainApp.status == .enabled { try? await SMAppService.mainApp.unregister() }
         UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "dev.harnessmodelrouter.menu")
@@ -220,6 +235,7 @@ final class RouterController: ObservableObject {
     }
 
     func openLog() { NSWorkspace.shared.open(paths.log) }
+    func openHelp() { NSWorkspace.shared.open(Self.usageGuideURL) }
     func revealConfig() { NSWorkspace.shared.activateFileViewerSelecting([paths.config]) }
     func dismissFeedback() { feedback = nil }
 

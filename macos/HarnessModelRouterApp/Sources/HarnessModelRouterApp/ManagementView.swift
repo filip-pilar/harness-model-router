@@ -90,6 +90,7 @@ private struct RoutesView: View {
             return DestinationItem(id: id, value: value)
         }.sorted { $0.value.name < $1.value.name }
     }
+    private var advertisedModels: [String] { controller.models(destination: route.destination, harness: harness) }
 
     var body: some View {
         HSplitView {
@@ -106,7 +107,7 @@ private struct RoutesView: View {
                 }
                 Picker("Destination", selection: $route.destination) { Text("Select…").tag(""); ForEach(compatibleDestinations) { Text($0.value.name).tag($0.id) } }
                 TextField("Model", text: $route.model)
-                if !controller.discoveredModels.isEmpty { Picker("Advertised models", selection: $route.model) { ForEach(controller.discoveredModels, id: \.self) { Text($0).tag($0) } } }
+                if !advertisedModels.isEmpty { Picker("Advertised models", selection: $route.model) { ForEach(advertisedModels, id: \.self) { Text($0).tag($0) } } }
                 Toggle("Enabled", isOn: $route.enabled)
                 HStack { Button("Test Connection / Models") { Task { await controller.testModels(destination: route.destination, harness: harness) } }.disabled(route.destination.isEmpty); Spacer() }
                 DisclosureGroup("Advanced", isExpanded: $advanced) {
@@ -151,13 +152,20 @@ private struct RoutesView: View {
 
 private struct AdvancedView: View {
     @ObservedObject var controller: RouterController
+    @State private var confirmForceReset = false
     var body: some View {
         Form {
             LabeledContent("Configuration") { Text(controller.paths.config.path).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
             LabeledContent("Gateway") { Text("127.0.0.1:9476") }
             Button("Reveal Config in Finder", action: controller.revealConfig)
             Text("Valid external edits reload automatically. Invalid edits are reported and left untouched.").font(.caption).foregroundStyle(.secondary)
-            if controller.pendingForceReset { Button("Force Reset Everything", role: .destructive) { controller.reset(force: true) } }
+            if controller.pendingForceReset { Button("Review Force Reset…", role: .destructive) { confirmForceReset = true } }
         }.formStyle(.grouped)
+        .alert("Force Reset Everything?", isPresented: $confirmForceReset) {
+            Button("Force Reset", role: .destructive) { controller.reset(force: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("These later edits conflict with restoration and may be overwritten:\n\n\(controller.pendingForceResetConflicts.joined(separator: "\n"))")
+        }
     }
 }

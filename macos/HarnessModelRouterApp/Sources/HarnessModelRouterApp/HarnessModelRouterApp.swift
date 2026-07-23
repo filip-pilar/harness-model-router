@@ -19,10 +19,22 @@ struct HarnessModelRouterMenuApp: App {
 }
 
 private struct RouterMenu: View {
+    private enum PresentedAlert: Identifiable {
+        case unverified(Harness)
+        case forceRemove(Harness)
+
+        var id: String {
+            switch self {
+            case .unverified(let harness): "unverified-\(harness.rawValue)"
+            case .forceRemove(let harness): "force-remove-\(harness.rawValue)"
+            }
+        }
+    }
+
     @ObservedObject var controller: RouterController
     @Environment(\.openWindow) private var openWindow
     @State private var confirmReset = false
-    @State private var warningHarness: Harness?
+    @State private var presentedAlert: PresentedAlert?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -72,6 +84,7 @@ private struct RouterMenu: View {
             Divider()
             HStack {
                 Button("Log", systemImage: "doc.text", action: controller.openLog)
+                Button("Help", systemImage: "questionmark.circle", action: controller.openHelp)
                 Button("Reset…", role: .destructive) { confirmReset = true }
                 Spacer()
                 Button("Quit", action: controller.quit)
@@ -83,10 +96,24 @@ private struct RouterMenu: View {
             Button("Reset Everything", role: .destructive) { controller.reset() }
             Button("Cancel", role: .cancel) {}
         } message: { Text("This restores router-owned Claude and Codex changes and deletes all destinations and routes.") }
-        .alert("Unverified harness version", isPresented: Binding(get: { warningHarness != nil }, set: { if !$0 { warningHarness = nil } })) {
-            Button("Set Up Anyway") { if let warningHarness { controller.setup(warningHarness) }; warningHarness = nil }
-            Button("Cancel", role: .cancel) { warningHarness = nil }
-        } message: { Text("This harness is older than the version verified with the router. You can continue, but its configuration format may differ.") }
+        .alert(item: $presentedAlert) { item in
+            switch item {
+            case .unverified(let harness):
+                Alert(
+                    title: Text("Unverified harness version"),
+                    message: Text("This harness is older than the version verified with the router. You can continue, but its configuration format may differ."),
+                    primaryButton: .default(Text("Set Up Anyway")) { controller.setup(harness) },
+                    secondaryButton: .cancel()
+                )
+            case .forceRemove(let harness):
+                Alert(
+                    title: Text("Force Remove Routing Setup?"),
+                    message: Text("These later edits conflict with restoration and may be overwritten:\n\n\(controller.pendingForceHarnessConflicts.joined(separator: "\n"))"),
+                    primaryButton: .destructive(Text("Force Remove")) { controller.remove(harness, force: true) },
+                    secondaryButton: .cancel()
+                )
+            }
+        }
     }
 
     private func harnessRow(_ harness: Harness) -> some View {
@@ -98,11 +125,11 @@ private struct RouterMenu: View {
                 if let version = detection?.version { Text(version).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
             }
             if configured {
-                if controller.pendingForceHarness == harness { Button("Force Remove", role: .destructive) { controller.remove(harness, force: true) } }
+                if controller.pendingForceHarness == harness { Button("Review…", role: .destructive) { presentedAlert = .forceRemove(harness) } }
                 else { Button("Remove") { controller.remove(harness) } }
             } else if detection?.detected == true {
                 Button("Set Up Routing") {
-                    if controller.versionNeedsWarning(harness) { warningHarness = harness } else { controller.setup(harness) }
+                    if controller.versionNeedsWarning(harness) { presentedAlert = .unverified(harness) } else { controller.setup(harness) }
                 }
             }
         }
