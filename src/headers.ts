@@ -1,4 +1,3 @@
-import { sameUpstream } from "./config.js";
 import type { Upstream } from "./types.js";
 
 const HOP_BY_HOP = new Set([
@@ -12,17 +11,13 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
-export function forwardedHeaders(source: Headers, original: Upstream, target: Upstream, env: NodeJS.ProcessEnv = process.env): Headers {
+export function forwardedHeaders(source: Headers, _original: Upstream, target: Upstream, env: NodeJS.ProcessEnv = process.env): Headers {
   const output = new Headers();
   const connectionTokens = new Set((source.get("connection") ?? "").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
   for (const [name, value] of source) {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP.has(lower) || connectionTokens.has(lower) || lower === "host" || lower === "content-length") continue;
     output.set(name, value);
-  }
-  if (!sameUpstream(original, target)) {
-    output.delete("authorization");
-    output.delete("x-api-key");
   }
   output.delete("content-encoding");
   if (target.authorization) {

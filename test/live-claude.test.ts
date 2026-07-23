@@ -55,12 +55,8 @@ describe("live Claude Code integration", () => {
     };
     await saveConfig(configPath, config);
     const gateway = await createGateway({ configPath });
-    await new Promise<void>((resolvePromise) => gateway.server.listen(0, "127.0.0.1", resolvePromise));
+    await new Promise<void>((resolvePromise) => gateway.server.listen(9476, "127.0.0.1", resolvePromise));
     servers.push(gateway.server);
-    const address = gateway.server.address();
-    if (!address || typeof address === "string") throw new Error("gateway address missing");
-    config.gateway.port = address.port;
-    await saveConfig(configPath, config);
 
     const cliPath = resolve(process.cwd(), "dist/cli.js");
     expect(await readFile(cliPath, "utf8")).toContain("harness-model-router");
@@ -117,9 +113,9 @@ describe("live Claude Code integration", () => {
     expect(original.captures.every((capture) => capture.body.model === parentModel)).toBe(true);
     expect(original.captures.every((capture) => !header(capture, "x-claude-code-agent-id"))).toBe(true);
 
-    const status = await fetch(`http://127.0.0.1:${address.port}/__router/status`).then((response) => response.json()) as { mappings: number };
+    const status = await fetch("http://127.0.0.1:9476/__router/status").then((response) => response.json()) as { mappings: number };
     expect(status.mappings).toBe(0);
-    const replay = await fetch(`http://127.0.0.1:${address.port}/claude/v1/messages`, {
+    const replay = await fetch("http://127.0.0.1:9476/claude/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",

@@ -59,12 +59,8 @@ describe("live Codex V1 integration", () => {
     await writeJson(config.harnesses.codex.sourceCatalogPath, sourceCatalog);
     await saveConfig(configPath, config);
     const gateway = await createGateway({ configPath });
-    await new Promise<void>((resolvePromise) => gateway.server.listen(0, "127.0.0.1", resolvePromise));
+    await new Promise<void>((resolvePromise) => gateway.server.listen(9476, "127.0.0.1", resolvePromise));
     servers.push(gateway.server);
-    const address = gateway.server.address();
-    if (!address || typeof address === "string") throw new Error("gateway address missing");
-    config.gateway.port = address.port;
-    await saveConfig(configPath, config);
 
     await writeFile(resolve(codexHome, "config.toml"), `model = ${JSON.stringify(parentModel)}\nmodel_provider = "original"\n\n[model_providers.original]\nname = "Original mock"\nbase_url = ${JSON.stringify(`${original.url}/v1`)}\nenv_key = "CODEX_LIVE_KEY"\nwire_api = "responses"\n\n[features]\nmulti_agent = true\nmulti_agent_v2 = false\nremote_plugin = false\nplugins = false\napps = false\n`);
     const cliPath = resolve(process.cwd(), "dist/cli.js");

@@ -37,14 +37,17 @@ interface InstallState {
 
 export interface InstallOptions {
   home: string;
-  project: string;
-  cliPath: string;
+  project?: string;
+  cliPath?: string;
   nodePath?: string;
+  helperPath?: string;
   force?: boolean;
   codexBinary?: string;
 }
 
 export interface LifecycleResult { changed: string[]; conflicts: string[] }
+
+export interface IntegrationStatus { claude: boolean; codex: boolean }
 
 export async function installIntegration(configPath: string, options: InstallOptions): Promise<LifecycleResult> {
   const config = await loadConfig(configPath);
@@ -52,14 +55,16 @@ export async function installIntegration(configPath: string, options: InstallOpt
   const conflicts: string[] = [];
   const statePath = installStatePath(configPath);
   const state = await readState(statePath);
-  const nodePath = options.nodePath ?? process.execPath;
   const quote = (value: string): string => JSON.stringify(value);
+  const hookPrefix = options.helperPath
+    ? quote(options.helperPath)
+    : `${quote(options.nodePath ?? process.execPath)} ${quote(options.cliPath ?? fileURLPathFallback())}`;
   if (config.harnesses.claude.enabled) {
     const path = config.harnesses.claude.settingsPath ?? resolve(options.home, ".claude/settings.json");
     const base = `http://${config.gateway.host}:${config.gateway.port}/claude`;
     const commands = [
-      `${quote(nodePath)} ${quote(options.cliPath)} --config ${quote(configPath)} hook claude-start`,
-      `${quote(nodePath)} ${quote(options.cliPath)} --config ${quote(configPath)} hook claude-stop`,
+      `${hookPrefix} --config ${quote(configPath)} hook claude-start`,
+      `${hookPrefix} --config ${quote(configPath)} hook claude-stop`,
     ];
     state.claude = await installClaudeSettings(path, base, commands, state.claude, options.force ?? false, conflicts);
     if (conflicts.length === 0) changed.push(path);
@@ -67,16 +72,25 @@ export async function installIntegration(configPath: string, options: InstallOpt
   if (config.harnesses.codex.enabled) {
     const hooksPath = config.harnesses.codex.hooksPath ?? resolve(options.home, ".codex/hooks.json");
     const codexConfigPath = config.harnesses.codex.configPath ?? resolve(options.home, ".codex/config.toml");
-    const hookCommand = `${quote(nodePath)} ${quote(options.cliPath)} --config ${quote(configPath)} hook codex-pretool`;
-    state.codexHooks = await installCodexHooks(hooksPath, hookCommand, Math.ceil(config.harnesses.codex.hookTimeoutMs / 1000), state.codexHooks, options.force ?? false, conflicts);
-    if (conflicts.length === 0) changed.push(hooksPath);
+    const hookCommand = `${hookPrefix} --config ${quote(configPath)} hook codex-pretool`;
     await adoptConfiguredCatalog(config, codexConfigPath);
-    await ensureSourceCatalog(config, configPath, options.codexBinary ?? "codex");
+    await ensureSourceCatalog(config, configPath, options.codexBinary, options.home);
     await writeCatalogOverlay(config);
     if (config.harnesses.codex.overlayCatalogPath) changed.push(config.harnesses.codex.overlayCatalogPath);
+    state.codexHooks = await installCodexHooks(hooksPath, hookCommand, Math.ceil(config.harnesses.codex.hookTimeoutMs / 1000), state.codexHooks, options.force ?? false, conflicts);
+    if (conflicts.length === 0) changed.push(hooksPath);
     state.codexConfig = await installCodexConfig(codexConfigPath, config, state.codexConfig, options.force ?? false, conflicts);
     if (conflicts.length === 0) changed.push(codexConfigPath);
-    const found = await discover({ home: options.home, project: options.project, config });
+    for (const [path, preserved] of Object.entries(config.preserved.customCodexAgents)) {
+      if (config.routes.codex[preserved.agentType]) continue;
+      if (!await exists(path)) { conflicts.push(`${path}: normalized custom agent is missing`); continue; }
+      const current = await readFile(path, "utf8");
+      if (hash(current) !== preserved.installedContentHash && !options.force) { conflicts.push(`${path}: custom agent changed after installation`); continue; }
+      await atomicWriteFile(path, restoreCustomModel(current, preserved, options.force ?? false));
+      delete config.preserved.customCodexAgents[path];
+      changed.push(path);
+    }
+    const found = await discover({ home: options.home, globalOnly: true, config });
     for (const routeAgent of Object.keys(config.routes.codex)) {
       const agent = selectCodexAgent(found.agents, routeAgent);
       if (agent?.path && agent.explicitModel) {
@@ -89,6 +103,59 @@ export async function installIntegration(configPath: string, options: InstallOpt
   if (conflicts.length === 0) {
     await saveConfig(configPath, config);
     await atomicWriteFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 0o600);
+  }
+  return { changed: [...new Set(changed)], conflicts };
+}
+
+function fileURLPathFallback(): string {
+  throw new Error("installIntegration requires cliPath unless helperPath is provided");
+}
+
+export async function integrationStatus(configPath: string): Promise<IntegrationStatus> {
+  const state = await readState(installStatePath(configPath));
+  return { claude: Boolean(state.claude), codex: Boolean(state.codexHooks || state.codexConfig) };
+}
+
+export async function uninstallHarnessIntegration(configPath: string, harness: "claude" | "codex", force = false): Promise<LifecycleResult> {
+  const config = await loadConfig(configPath);
+  const statePath = installStatePath(configPath);
+  const state = await readState(statePath);
+  const changed: string[] = [];
+  const conflicts: string[] = [];
+  if (harness === "claude") {
+    if (state.claude && await uninstallJsonMutation(state.claude, force, conflicts, "claude")) {
+      changed.push(state.claude.path);
+      delete state.claude;
+    }
+    if (conflicts.length === 0 || force) config.harnesses.claude.enabled = false;
+  } else {
+    if (state.codexHooks && await uninstallJsonMutation(state.codexHooks, force, conflicts, "codex")) {
+      changed.push(state.codexHooks.path);
+      delete state.codexHooks;
+    }
+    if (state.codexConfig && await uninstallCodexConfig(state.codexConfig, force, conflicts)) {
+      changed.push(state.codexConfig.path);
+      delete state.codexConfig;
+    }
+    for (const [path, preserved] of Object.entries(config.preserved.customCodexAgents)) {
+      if (!await exists(path)) { conflicts.push(`${path}: normalized custom agent is missing`); continue; }
+      const current = await readFile(path, "utf8");
+      if (hash(current) !== preserved.installedContentHash && !force) { conflicts.push(`${path}: custom agent changed after installation`); continue; }
+      const restored = restoreCustomModel(current, preserved, force);
+      await atomicWriteFile(path, restored);
+      delete config.preserved.customCodexAgents[path];
+      changed.push(path);
+    }
+    if (conflicts.length === 0 || force) {
+      config.harnesses.codex.enabled = false;
+      const overlay = config.harnesses.codex.overlayCatalogPath;
+      if (overlay && await exists(overlay)) { await unlink(overlay); changed.push(overlay); }
+    }
+  }
+  if (conflicts.length === 0 || force) {
+    await saveConfig(configPath, config);
+    if (state.claude || state.codexHooks || state.codexConfig) await atomicWriteFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 0o600);
+    else if (await exists(statePath)) await unlink(statePath);
   }
   return { changed: [...new Set(changed)], conflicts };
 }
@@ -150,18 +217,27 @@ export async function writeCatalogOverlay(config: RouterConfig): Promise<void> {
   await atomicWriteFile(targetPath, `${JSON.stringify(result, null, 2)}\n`, 0o600);
 }
 
-async function ensureSourceCatalog(config: RouterConfig, configPath: string, codexBinary: string): Promise<void> {
+async function ensureSourceCatalog(config: RouterConfig, configPath: string, codexBinary: string | undefined, home: string): Promise<void> {
   if (config.harnesses.codex.sourceCatalogPath && await exists(config.harnesses.codex.sourceCatalogPath)) return;
   const target = resolve(dirname(configPath), "codex-source-catalog.json");
-  try {
+  const failures: string[] = [];
+  if (codexBinary) try {
     const { stdout } = await execFileAsync(codexBinary, ["debug", "models", "--bundled"], { maxBuffer: 64 * 1024 * 1024 });
     const parsed = JSON.parse(stdout) as ModelCatalog;
     if (!Array.isArray(parsed.models)) throw new Error("catalog has no models array");
     await atomicWriteFile(target, `${JSON.stringify(parsed, null, 2)}\n`, 0o600);
     config.harnesses.codex.sourceCatalogPath = target;
-  } catch (error) {
-    throw new Error(`Unable to capture the installed Codex catalog: ${error instanceof Error ? error.message : String(error)}`);
-  }
+    return;
+  } catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
+  const cachePath = resolve(home, ".codex/models_cache.json");
+  if (await exists(cachePath)) try {
+    const parsed = JSON.parse(await readFile(cachePath, "utf8")) as ModelCatalog;
+    if (!Array.isArray(parsed.models)) throw new Error("model cache has no models array");
+    await atomicWriteFile(target, `${JSON.stringify(parsed, null, 2)}\n`, 0o600);
+    config.harnesses.codex.sourceCatalogPath = target;
+    return;
+  } catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
+  throw new Error(`Unable to capture the installed Codex catalog${failures.length ? `: ${failures.join("; ")}` : ". Open Codex once or install its CLI so a model catalog is available."}`);
 }
 
 async function installClaudeSettings(path: string, baseUrl: string, commands: string[], prior: JsonMutation | undefined, force: boolean, conflicts: string[]): Promise<JsonMutation> {

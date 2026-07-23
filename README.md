@@ -6,7 +6,21 @@ The MVP deliberately does not translate protocols. Claude routes must target an 
 
 ## Quick start
 
-Requires Node.js 20 or newer.
+### macOS menu app
+
+The native Apple Silicon app owns the gateway, detects Claude Code and Codex, manages reusable destinations and routes, and can surgically set up or restore either harness.
+
+```sh
+npm install
+npm run build:macos
+open "dist/Harness Model Router.app"
+```
+
+The app is ad-hoc signed and targets macOS 15 or newer. Its global state lives under `~/.local/share/harness-model-router/`. It never installs Claude Code or Codex and changes harness configuration only after **Set Up Routing** is clicked.
+
+### CLI
+
+Requires Node.js 20 or newer. The CLI uses the same global configuration by default.
 
 ```sh
 npm install
@@ -14,7 +28,7 @@ npm run build
 node dist/cli.js init
 ```
 
-Edit `.harness-model-router/config.json` to enable the harnesses you use and confirm their original upstreams. Add routes with the CLI:
+Edit `~/.local/share/harness-model-router/config.json` or use the app. Add routes with the CLI:
 
 ```sh
 node dist/cli.js route set claude Explore \
@@ -49,12 +63,19 @@ The generated JSON is user-editable and contains no credentials. A condensed exa
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "gateway": {
     "enabled": true,
     "host": "127.0.0.1",
     "port": 9476,
     "maxBodyBytes": 16777216
+  },
+  "destinations": {
+    "devin": {
+      "name": "Devin Bridge",
+      "openaiBaseUrl": "http://127.0.0.1:4317/openai/v1",
+      "anthropicBaseUrl": "http://127.0.0.1:4317/claude"
+    }
   },
   "harnesses": {
     "claude": {
@@ -78,8 +99,12 @@ The generated JSON is user-editable and contains no credentials. A condensed exa
     }
   },
   "routes": {
-    "claude": {},
-    "codex": {}
+    "claude": {
+      "Explore": { "enabled": true, "model": "swe-1-6-slow", "destination": "devin" }
+    },
+    "codex": {
+      "explorer": { "enabled": true, "alias": "router-explorer", "model": "swe-1-6-slow", "destination": "devin" }
+    }
   },
   "preserved": {
     "customCodexAgents": {}
@@ -87,7 +112,7 @@ The generated JSON is user-editable and contains no credentials. A condensed exa
 }
 ```
 
-Each route has `enabled`, `model`, and an `upstream` containing `baseUrl` and its required protocol. Codex routes also have a unique hidden `alias` and may request `requiredMultiAgentVersion: "v1"`. Absence of a route means passthrough.
+Each route references a reusable destination and has `enabled` and `model`. Codex routes also have a unique hidden `alias` and may request `requiredMultiAgentVersion: "v1"`. Missing destinations remain representable as visibly broken routes. Version 1 inline-upstream configurations are migrated automatically.
 
 For custom endpoint authorization, reference an environment variable rather than storing a credential:
 
@@ -99,7 +124,7 @@ For custom endpoint authorization, reference an environment variable rather than
 }
 ```
 
-Headers are preserved for the original upstream except for hop-by-hop transport fields. On a different endpoint, `Authorization` is removed before an optional environment-backed header is constructed. Logs and surfaced errors redact common credential fields and bearer/basic values.
+End-to-end headers, including authentication and provider-specific fields, are preserved across configured destinations. HTTP transport fields such as `Host`, `Content-Length`, `Connection`, and other hop-by-hop headers are removed or reconstructed. An optional environment-backed authorization reference can override its selected header. Logs and surfaced errors redact common credential fields and bearer/basic values.
 
 ## Routing behavior
 

@@ -11,7 +11,8 @@ const CODEX_BUILT_INS = ["default", "worker", "explorer"];
 
 export interface DiscoveryOptions {
   home: string;
-  project: string;
+  project?: string;
+  globalOnly?: boolean;
   config?: RouterConfig;
 }
 
@@ -21,10 +22,10 @@ export async function discover(options: DiscoveryOptions): Promise<DiscoveryResu
     ...CODEX_BUILT_INS.map((name): DiscoveredAgent => ({ harness: "codex", name, kind: "built-in" })),
   ];
   await discoverClaudeDirectory(resolve(options.home, ".claude/agents"), "user", agents);
-  await discoverClaudeDirectory(resolve(options.project, ".claude/agents"), "project", agents);
+  if (!options.globalOnly && options.project) await discoverClaudeDirectory(resolve(options.project, ".claude/agents"), "project", agents);
   await discoverClaudePlugins(resolve(options.home, ".claude/plugins"), agents);
   await discoverCodexDirectory(resolve(options.home, ".codex/agents"), "user", agents);
-  await discoverCodexDirectory(resolve(options.project, ".codex/agents"), "project", agents);
+  if (!options.globalOnly && options.project) await discoverCodexDirectory(resolve(options.project, ".codex/agents"), "project", agents);
   const catalogPath = options.config?.harnesses.codex.sourceCatalogPath;
   const result: DiscoveryResult = { agents: deduplicate(agents) };
   if (catalogPath && await exists(catalogPath)) {
@@ -39,18 +40,26 @@ export async function discover(options: DiscoveryOptions): Promise<DiscoveryResu
 
 async function discoverClaudeDirectory(directory: string, kind: "user" | "project" | "plugin", output: DiscoveredAgent[]): Promise<void> {
   for (const path of await filesUnder(directory, ".md", kind === "plugin" ? 6 : 1)) {
-    try {
-      const content = await readFile(path, "utf8");
-      const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content)?.[1];
-      const metadata = frontmatter ? parseYaml(frontmatter) as Record<string, unknown> : {};
-      const name = typeof metadata.name === "string" ? metadata.name : basename(path, ".md");
-      output.push({ harness: "claude", name, kind, path, ...(typeof metadata.model === "string" ? { explicitModel: metadata.model } : {}) });
-    } catch { /* malformed agents are discoverable only after users fix them */ }
+    await discoverClaudeFile(path, kind, output);
   }
 }
 
 async function discoverClaudePlugins(directory: string, output: DiscoveredAgent[]): Promise<void> {
-  await discoverClaudeDirectory(directory, "plugin", output);
+  for (const path of await filesUnder(directory, ".md", 8)) {
+    const relativeParts = path.slice(directory.length).split("/").filter(Boolean);
+    if (!relativeParts.slice(0, -1).includes("agents")) continue;
+    await discoverClaudeFile(path, "plugin", output);
+  }
+}
+
+async function discoverClaudeFile(path: string, kind: "user" | "project" | "plugin", output: DiscoveredAgent[]): Promise<void> {
+  try {
+    const content = await readFile(path, "utf8");
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content)?.[1];
+    const metadata = frontmatter ? parseYaml(frontmatter) as Record<string, unknown> : {};
+    const name = typeof metadata.name === "string" ? metadata.name : basename(path, ".md");
+    output.push({ harness: "claude", name, kind, path, ...(typeof metadata.model === "string" ? { explicitModel: metadata.model } : {}) });
+  } catch { /* malformed agents are discoverable only after users fix them */ }
 }
 
 async function discoverCodexDirectory(directory: string, kind: "user" | "project", output: DiscoveredAgent[]): Promise<void> {

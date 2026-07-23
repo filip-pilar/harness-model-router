@@ -16,6 +16,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:helper": "node bin/build-helper.mjs",
+    "build:macos": "node bin/build-macos-app.mjs",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
     "lint": "eslint . --max-warnings=0",
     "start": "node dist/cli.js start",
@@ -24,7 +26,8 @@
     "test:live": "npm run test:live-codex && npm run test:live-claude",
     "test:live-claude": "HMR_LIVE_CLAUDE=1 vitest run test/live-claude.test.ts",
     "test:live-codex": "HMR_LIVE_CODEX=1 vitest run test/live-codex.test.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:native": "CLANG_MODULE_CACHE_PATH=\"$PWD/.build/swift-module-cache\" SWIFTPM_MODULECACHE_OVERRIDE=\"$PWD/.build/swift-module-cache\" swift test --disable-sandbox --package-path macos/HarnessModelRouterApp --scratch-path .build/macos-swift-tests"
   },
   "engines": {
     "node": ">=20"

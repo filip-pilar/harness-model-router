@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { decompress as zstdDecompress } from "fzstd";
@@ -9,6 +10,7 @@ import { forwardedHeaders, responseHeaders } from "./headers.js";
 import { ClaudeIdentityStore } from "./identity.js";
 import { safeError } from "./redact.js";
 import type { ClaudeHookInput, RouterConfig } from "./types.js";
+import { ROUTER_VERSION } from "./version.js";
 
 export interface GatewayOptions {
   configPath: string;
@@ -18,11 +20,12 @@ export interface GatewayOptions {
 
 export async function createGateway(options: GatewayOptions): Promise<{ server: Server; identities: ClaudeIdentityStore; config: RouterConfig }> {
   const initial = await loadConfig(options.configPath);
+  const configState = { value: initial };
   const identities = new ClaudeIdentityStore(initial.harnesses.claude.mappingTtlMs);
   const requestFetch = options.fetch ?? globalThis.fetch;
   const server = createServer(async (request, response) => {
     try {
-      await handleRequest(request, response, options.configPath, identities, requestFetch, options.logger);
+      await handleRequest(request, response, options.configPath, configState, identities, requestFetch, options.logger);
     } catch (error) {
       if (!response.headersSent) json(response, 502, { error: { type: "gateway_error", message: safeError(error) } });
       else response.destroy(error instanceof Error ? error : new Error(String(error)));
@@ -45,19 +48,37 @@ async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
   configPath: string,
+  configState: { value: RouterConfig },
   identities: ClaudeIdentityStore,
   requestFetch: typeof globalThis.fetch,
   logger?: (record: Record<string, unknown>) => void,
 ): Promise<void> {
-  const config = await loadConfig(configPath);
+  let config = configState.value;
+  try {
+    config = await loadConfig(configPath);
+    configState.value = config;
+  } catch (error) {
+    logger?.({ event: "config_invalid", error: safeError(error) });
+  }
   const requestUrl = new URL(request.url ?? "/", "http://localhost");
-  if (requestUrl.pathname === "/__router/status") return void json(response, 200, { ok: true, mappings: identities.size });
+  if (requestUrl.pathname === "/__router/status" || requestUrl.pathname === "/__router/readiness") {
+    response.setHeader("x-harness-model-router", "1");
+    return void json(response, 200, {
+      ready: true,
+      service: "harness-model-router",
+      version: ROUTER_VERSION,
+      mappings: identities.size,
+      harnesses: { claude: config.harnesses.claude.enabled, codex: config.harnesses.codex.enabled },
+      routeCount: { claude: Object.keys(config.routes.claude).length, codex: Object.keys(config.routes.codex).length },
+    });
+  }
   if (requestUrl.pathname === "/__router/claude/start" || requestUrl.pathname === "/__router/claude/stop") {
     if (request.method !== "POST") return void json(response, 405, { error: "method_not_allowed" });
     const input = JSON.parse((await readBody(request, config.gateway.maxBodyBytes)).toString("utf8")) as ClaudeHookInput;
     validateClaudeHook(input, requestUrl.pathname.endsWith("start") ? "SubagentStart" : "SubagentStop");
     if (input.hook_event_name === "SubagentStart") identities.register(input.session_id, input.agent_id, input.agent_type);
     else identities.remove(input.session_id, input.agent_id);
+    logger?.({ event: "claude_hook", action: input.hook_event_name === "SubagentStart" ? "start" : "stop", sessionId: input.session_id, agentId: input.agent_id, agentType: input.agent_type, mappings: identities.size });
     return void json(response, 204, undefined);
   }
   const protocol = protocolForPath(requestUrl.pathname);
@@ -90,13 +111,7 @@ async function handleRequest(
   response.statusMessage = upstream.statusText;
   for (const [name, value] of responseHeaders(upstream.headers)) response.setHeader(name, value);
   if (!upstream.body) return void response.end();
-  await new Promise<void>((resolve, reject) => {
-    const stream = Readable.fromWeb(upstream.body as NodeReadableStream);
-    stream.once("error", reject);
-    response.once("error", reject);
-    response.once("finish", resolve);
-    stream.pipe(response);
-  });
+  await pipeline(Readable.fromWeb(upstream.body as NodeReadableStream), response);
 }
 
 function validateClaudeHook(value: ClaudeHookInput, expected: ClaudeHookInput["hook_event_name"]): void {

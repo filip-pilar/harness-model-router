@@ -13,6 +13,7 @@ describe("agent discovery", () => {
       claudeUser: resolve(home, ".claude/agents/user-agent.md"),
       claudeProject: resolve(project, ".claude/agents/project-agent.md"),
       claudePlugin: resolve(home, ".claude/plugins/cache/plugin/1.0/agents/plugin-agent.md"),
+      claudePluginReadme: resolve(home, ".claude/plugins/cache/plugin/1.0/README.md"),
       codexUser: resolve(home, ".codex/agents/reviewer.toml"),
       codexProject: resolve(project, ".codex/agents/auditor.toml"),
     };
@@ -20,6 +21,7 @@ describe("agent discovery", () => {
     await writeFile(paths.claudeUser, "---\nname: user-agent\ndescription: user\nmodel: sonnet\n---\nPrompt\n");
     await writeFile(paths.claudeProject, "---\nname: project-agent\ndescription: project\n---\nPrompt\n");
     await writeFile(paths.claudePlugin, "---\nname: plugin-agent\ndescription: plugin\n---\nPrompt\n");
+    await writeFile(paths.claudePluginReadme, "---\nname: not-an-agent\n---\nDocumentation\n");
     await writeFile(paths.codexUser, 'name = "reviewer"\ndescription = "review"\ndeveloper_instructions = "review"\nmodel = "gpt-custom"\n');
     await writeFile(paths.codexProject, 'name = "auditor"\ndescription = "audit"\ndeveloper_instructions = "audit"\n');
     const result = await discover({ home, project });
@@ -30,6 +32,9 @@ describe("agent discovery", () => {
       expect.objectContaining({ harness: "claude", name: "plugin-agent", kind: "plugin" }),
       expect.objectContaining({ harness: "codex", name: "reviewer", kind: "user", explicitModel: "gpt-custom" }),
       expect.objectContaining({ harness: "codex", name: "auditor", kind: "project" }),
+    ]));
+    expect(result.agents).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ harness: "claude", name: "not-an-agent" }),
     ]));
   });
 });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Server } from "node:http";
 import { gzipSync } from "node:zlib";
+import { writeFile } from "node:fs/promises";
 import { createGateway } from "../src/gateway.js";
 import { saveConfig } from "../src/config.js";
 import { captureServer, close, temporaryRoot, testConfig } from "./helpers.js";
@@ -42,7 +43,7 @@ describe("localhost gateway acceptance", () => {
     expect(original.captures.map((item) => item.body.model)).toEqual(["claude-main", "claude-main", "claude-main", "codex-parent"]);
     expect(custom.captures.map((item) => item.body.model)).toEqual(["claude-routed", "codex-routed"]);
     expect(original.captures[0]?.headers.authorization).toBe("Bearer original");
-    expect(custom.captures.every((item) => item.headers.authorization === undefined)).toBe(true);
+    expect(custom.captures.every((item) => item.headers.authorization === "Bearer original")).toBe(true);
     expect(original.captures[0]?.path).toBe("/v1/messages");
     expect(original.captures[3]?.path).toBe("/v1/responses");
   });
@@ -100,6 +101,26 @@ describe("localhost gateway acceptance", () => {
     expect(second.captures).toHaveLength(20);
     expect(first.captures.every((item) => item.body.model === "first-model")).toBe(true);
     expect(second.captures.every((item) => item.body.model === "second-model")).toBe(true);
+  });
+
+  it("continues using the last valid configuration while an external edit is invalid", async () => {
+    const root = await temporaryRoot();
+    const original = await captureServer();
+    servers.push(original.server);
+    const { config, path } = await testConfig(root);
+    config.harnesses.codex.originalUpstream.baseUrl = original.url;
+    await saveConfig(path, config);
+    const records: Array<Record<string, unknown>> = [];
+    const gateway = await createGateway({ configPath: path, logger: (record) => records.push(record) });
+    await new Promise<void>((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+    servers.push(gateway.server);
+    const address = gateway.server.address();
+    if (!address || typeof address === "string") throw new Error("gateway address missing");
+    await writeFile(path, "{ invalid json");
+    const response = await fetch(`http://127.0.0.1:${address.port}/__router/readiness`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-harness-model-router")).toBe("1");
+    expect(records.some((record) => record.event === "config_invalid")).toBe(true);
   });
 });
 

@@ -4,20 +4,22 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { catalogOverlaySummary, type ModelCatalog } from "./catalog.js";
-import { defaultConfig, loadConfig, saveConfig, validateConfig } from "./config.js";
+import { appPaths, appState, ensureGlobalConfig, removeHarness, replaceAppConfig, resetEverything, setupHarness } from "./app.js";
+import { defaultConfig, defaultGlobalConfig, loadConfig, routeUpstream, saveConfig, validateConfig } from "./config.js";
 import { discover } from "./discovery.js";
 import { exists } from "./files.js";
 import { listenGateway } from "./gateway.js";
 import { deliverClaudeHook, runCodexPreToolHook } from "./hooks.js";
 import { installIntegration, uninstallIntegration, writeCatalogOverlay } from "./lifecycle.js";
 import { safeError } from "./redact.js";
-import type { ClaudeHookInput, CodexPreToolInput, Harness, Protocol, Route, RouterConfig } from "./types.js";
+import type { ClaudeHookInput, CodexPreToolInput, Harness, Route, RouterConfig } from "./types.js";
+import { ROUTER_VERSION } from "./version.js";
 
 async function main(rawArgs: string[]): Promise<void> {
   const { args, configPath } = globalArguments(rawArgs);
   const [command, ...rest] = args;
   if (!command || command === "help" || command === "--help" || command === "-h") return void await printHelp();
-  if (command === "--version" || command === "-v") return void console.log(await packageVersion());
+  if (command === "--version" || command === "-v") return void console.log(ROUTER_VERSION);
   switch (command) {
     case "init": return void await initialize(configPath, rest.includes("--force"));
     case "validate": return void await validate(configPath, rest.includes("--json"));
@@ -33,13 +35,19 @@ async function main(rawArgs: string[]): Promise<void> {
     case "disable": return void await disableHarness(configPath, rest[0]);
     case "enable": return void await enableHarness(configPath, rest[0]);
     case "hook": return void await hookCommand(configPath, rest[0]);
+    case "app-state": return void await printAppState(configPath);
+    case "setup": return void await setup(configPath, rest);
+    case "remove": return void await remove(configPath, rest);
+    case "config": return void await configCommand(configPath, rest);
+    case "reset": return void await reset(configPath, rest.includes("--force"));
+    case "models": return void await models(configPath, rest);
     default: throw new Error(`Unknown command: ${command}`);
   }
 }
 
 function globalArguments(raw: string[]): { args: string[]; configPath: string } {
   const args = [...raw];
-  let configPath = process.env.HMR_CONFIG ?? resolve(process.cwd(), ".harness-model-router/config.json");
+  let configPath = process.env.HMR_CONFIG ?? appPaths(testableHome()).config;
   const index = args.indexOf("--config");
   if (index >= 0) {
     const value = args[index + 1];
@@ -52,7 +60,8 @@ function globalArguments(raw: string[]): { args: string[]; configPath: string } 
 
 async function initialize(path: string, force: boolean): Promise<void> {
   if (await exists(path) && !force) throw new Error(`${path} already exists; use --force to replace it`);
-  await saveConfig(path, defaultConfig(dirname(dirname(path))));
+  const globalPath = appPaths(testableHome()).config;
+  await saveConfig(path, path === globalPath ? defaultGlobalConfig(dirname(path)) : defaultConfig(dirname(dirname(path))));
   console.log(`Initialized ${path}`);
 }
 
@@ -66,7 +75,7 @@ async function validate(path: string, json: boolean): Promise<void> {
 
 async function runDiscovery(path: string, json: boolean): Promise<void> {
   const config = await optionalConfig(path);
-  const result = await discover({ home: testableHome(), project: process.cwd(), ...(config ? { config } : {}) });
+  const result = await discover({ home: testableHome(), globalOnly: true, ...(config ? { config } : {}) });
   if (json) return void console.log(JSON.stringify(result, null, 2));
   for (const agent of result.agents) console.log(`${agent.harness}\t${agent.kind}\t${agent.name}${agent.explicitModel ? `\tmodel=${agent.explicitModel}` : ""}${agent.path ? `\t${agent.path}` : ""}`);
 }
@@ -88,12 +97,18 @@ function printLifecycle(result: { changed: string[]; conflicts: string[] }): voi
 }
 
 async function start(path: string): Promise<void> {
+  await ensureGlobalConfig(path, testableHome());
   const server = await listenGateway({ configPath: path, logger: (record) => console.error(JSON.stringify(record)) });
   const address = server.address();
   console.log(`Gateway listening on ${typeof address === "object" && address ? `${address.address}:${address.port}` : String(address)}`);
   const shutdown = (): void => { server.close(() => process.exit(0)); };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+  if (process.argv.includes("--parent-lifeline")) {
+    process.stdin.resume();
+    process.stdin.once("end", shutdown);
+    process.stdin.once("close", shutdown);
+  }
 }
 
 async function status(path: string, json: boolean): Promise<void> {
@@ -110,7 +125,10 @@ async function status(path: string, json: boolean): Promise<void> {
 
 async function routes(path: string, json: boolean): Promise<void> {
   const config = await loadConfig(path);
-  const effective = (Object.entries(config.routes) as Array<[Harness, Record<string, Route>]>).flatMap(([harness, entries]) => Object.entries(entries).map(([agent, route]) => ({ harness, agent, enabled: route.enabled && config.harnesses[harness].enabled, alias: route.alias, wireModel: route.model, endpoint: route.upstream.baseUrl, protocol: route.upstream.protocol, requiredMultiAgentVersion: route.requiredMultiAgentVersion })));
+  const effective = (Object.entries(config.routes) as Array<[Harness, Record<string, Route>]>).flatMap(([harness, entries]) => Object.entries(entries).map(([agent, route]) => {
+    const upstream = routeUpstream(config, harness, route);
+    return { harness, agent, enabled: route.enabled && config.harnesses[harness].enabled && Boolean(upstream), broken: !upstream, destination: route.destination, alias: route.alias, wireModel: route.model, endpoint: upstream?.baseUrl, protocol: upstream?.protocol, requiredMultiAgentVersion: route.requiredMultiAgentVersion };
+  }));
   if (json) console.log(JSON.stringify(effective, null, 2));
   else for (const route of effective) console.log(`${route.harness}\t${route.agent}\t${route.enabled ? "enabled" : "disabled"}\t${route.alias ?? "-"}\t${route.wireModel}\t${route.endpoint}`);
 }
@@ -141,18 +159,19 @@ async function routeCommand(path: string, args: string[]): Promise<void> {
     const model = option(args, "--model");
     const endpoint = option(args, "--endpoint");
     if (!model || !endpoint) throw new Error("route set requires --model and --endpoint");
-    const protocol: Protocol = harnessValue === "claude" ? "anthropic-messages" : "openai-responses";
     const alias = harnessValue === "codex" ? option(args, "--alias") ?? `router-${agent.toLowerCase().replace(/[^a-z0-9-]+/g, "-")}` : undefined;
     const authorizationEnv = option(args, "--auth-env");
+    const destination = option(args, "--destination") ?? `${harnessValue}-${agent.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+    config.destinations[destination] ??= {
+      name: `${harnessValue === "claude" ? "Claude" : "Codex"} · ${agent}`,
+      ...(harnessValue === "claude" ? { anthropicBaseUrl: endpoint } : { openaiBaseUrl: endpoint }),
+    };
     config.routes[harnessValue][agent] = {
       enabled: !args.includes("--disabled"),
       ...(alias ? { alias } : {}),
       model,
-      upstream: {
-        baseUrl: endpoint,
-        protocol,
-        ...(authorizationEnv ? { authorization: { env: authorizationEnv, ...(option(args, "--auth-header") ? { header: option(args, "--auth-header")! } : {}), ...(option(args, "--auth-scheme") ? { scheme: option(args, "--auth-scheme")! } : {}) } } : {}),
-      },
+      destination,
+      ...(authorizationEnv ? { authorization: { env: authorizationEnv, ...(option(args, "--auth-header") ? { header: option(args, "--auth-header")! } : {}), ...(option(args, "--auth-scheme") ? { scheme: option(args, "--auth-scheme")! } : {}) } } : {}),
       ...(option(args, "--multi-agent-version") === "v1" ? { requiredMultiAgentVersion: "v1" as const } : {}),
     };
   }
@@ -205,18 +224,59 @@ async function optionalConfig(path: string): Promise<RouterConfig | undefined> {
 function testableHome(): string { return process.env.HMR_HOME ? resolve(process.env.HMR_HOME) : homedir(); }
 async function readStdin(): Promise<string> { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks).toString("utf8"); }
 
-async function packageVersion(): Promise<string> {
-  const packagePath = resolve(dirname(fileURLToPath(import.meta.url)), "../package.json");
-  const value = JSON.parse(await readFile(packagePath, "utf8")) as { version?: unknown };
-  if (typeof value.version !== "string") throw new Error(`Missing package version in ${packagePath}`);
-  return value.version;
+async function printHelp(): Promise<void> {
+  console.log(`harness-model-router ${ROUTER_VERSION}\n\nCommands:\n  app-state --json\n  setup <claude|codex> --helper-path <path>\n  remove <claude|codex> [--force]\n  config get|replace\n  reset [--force]\n  models <destination> <claude|codex>\n  init [--force]\n  discover [--json]\n  install [--force]\n  validate [--json]\n  route set <claude|codex> <agent> --model <slug> --endpoint <url> [--alias <alias>]\n  route enable|disable <claude|codex> <agent>\n  routes [--json]\n  catalog [--json]\n  status [--json]\n  start [--parent-lifeline]\n  enable|disable <claude|codex|all>\n  restore|uninstall [--force]\n\nGlobal:\n  --config <path>`);
 }
 
-async function printHelp(): Promise<void> {
-  console.log(`harness-model-router ${await packageVersion()}\n\nCommands:\n  init [--force]\n  discover [--json]\n  install [--force]\n  validate [--json]\n  route set <claude|codex> <agent> --model <slug> --endpoint <url> [--alias <alias>]\n  route enable|disable <claude|codex> <agent>\n  routes [--json]\n  catalog [--json]\n  status [--json]\n  start\n  enable|disable <claude|codex|all>\n  restore|uninstall [--force]\n\nGlobal:\n  --config <path>`);
+async function printAppState(path: string): Promise<void> { console.log(JSON.stringify(await appState(path, testableHome()), null, 2)); }
+
+async function setup(path: string, args: string[]): Promise<void> {
+  const harness = harnessArgument(args[0]);
+  const helperPath = option(args, "--helper-path") ?? appPaths(testableHome()).helper;
+  console.log(JSON.stringify(await setupHarness(path, harness, helperPath, testableHome(), args.includes("--force")), null, 2));
+}
+
+async function remove(path: string, args: string[]): Promise<void> {
+  const harness = harnessArgument(args[0]);
+  console.log(JSON.stringify(await removeHarness(path, harness, args.includes("--force")), null, 2));
+}
+
+async function configCommand(path: string, args: string[]): Promise<void> {
+  if (args[0] === "get") return void console.log(JSON.stringify(await ensureGlobalConfig(path, testableHome()), null, 2));
+  if (args[0] !== "replace") throw new Error("config requires get or replace");
+  const raw = JSON.parse(await readStdin()) as unknown;
+  const helperPath = option(args, "--helper-path") ?? appPaths(testableHome()).helper;
+  console.log(JSON.stringify(await replaceAppConfig(path, raw, helperPath, testableHome()), null, 2));
+}
+
+async function reset(path: string, force: boolean): Promise<void> { console.log(JSON.stringify(await resetEverything(path, testableHome(), force), null, 2)); }
+
+async function models(path: string, args: string[]): Promise<void> {
+  const destinationId = args[0];
+  const harness = harnessArgument(args[1]);
+  if (!destinationId) throw new Error("models requires a destination id");
+  const config = await loadConfig(path);
+  const destination = config.destinations[destinationId];
+  if (!destination) throw new Error(`Unknown destination ${destinationId}`);
+  const base = harness === "claude" ? destination.anthropicBaseUrl : destination.openaiBaseUrl;
+  if (!base) throw new Error(`Destination ${destinationId} does not support ${harness}`);
+  const url = new URL(base);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}${url.pathname.replace(/\/$/, "").endsWith("/v1") ? "" : "/v1"}/models`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(3_000) });
+  if (!response.ok) throw new Error(`Models endpoint returned HTTP ${response.status}`);
+  const payload = await response.json() as { data?: Array<{ id?: unknown }>; models?: Array<{ id?: unknown; slug?: unknown }> };
+  const values = [...(payload.data ?? []), ...(payload.models ?? [])].map((item) => typeof item.id === "string" ? item.id : typeof (item as any).slug === "string" ? (item as any).slug as string : undefined).filter((item): item is string => Boolean(item));
+  console.log(JSON.stringify({ reachable: true, models: [...new Set(values)].sort() }, null, 2));
+}
+
+function harnessArgument(value: string | undefined): Harness {
+  if (value !== "claude" && value !== "codex") throw new Error("expected claude or codex");
+  return value;
 }
 
 main(process.argv.slice(2)).catch((error) => {
-  console.error(`harness-model-router: ${safeError(error)}`);
+  const message = safeError(error);
+  if (process.argv.includes("--json")) console.log(JSON.stringify({ ok: false, error: message }, null, 2));
+  else console.error(`harness-model-router: ${message}`);
   process.exitCode = 1;
 });

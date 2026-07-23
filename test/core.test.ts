@@ -61,7 +61,7 @@ describe("validation and safety", () => {
     expect(validateConfig(config).join("\n")).toMatch(/supports only v1/);
   });
 
-  it("preserves original headers, strips cross-endpoint credentials, and injects env authorization", () => {
+  it("preserves end-to-end headers across endpoints and injects env authorization", () => {
     const original = { baseUrl: "http://original/v1", protocol: "openai-responses" as const };
     const source = new Headers({ Authorization: "Bearer secret", "X-Api-Key": "anthropic-secret", "X-Custom": "keep", Connection: "x-remove", "X-Remove": "gone" });
     const same = forwardedHeaders(source, original, original);
@@ -72,7 +72,7 @@ describe("validation and safety", () => {
     const target = { baseUrl: "http://custom/v1", protocol: "openai-responses" as const, authorization: { env: "CUSTOM_KEY", scheme: "Bearer" } };
     const routed = forwardedHeaders(source, original, target, { CUSTOM_KEY: "new-secret" });
     expect(routed.get("authorization")).toBe("Bearer new-secret");
-    expect(routed.has("x-api-key")).toBe(false);
+    expect(routed.get("x-api-key")).toBe("anthropic-secret");
   });
 
   it("redacts credentials recursively and in error text", () => {

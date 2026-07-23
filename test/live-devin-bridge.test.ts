@@ -16,12 +16,12 @@ const DENIED_MODEL = process.env.HMR_DEVIN_DENIED_MODEL ?? "swe-1-7-lightning";
 const live = process.env.HMR_LIVE_DEVIN_BRIDGE === "1";
 const servers: Server[] = [];
 
-interface UpstreamCapture { url: string; body: Record<string, any> }
+interface UpstreamCapture { url: string; body: Record<string, any>; headers: Record<string, string>; responseStatus?: number; responseContentType?: string }
 
 afterEach(async () => { while (servers.length) await close(servers.pop()!); });
 
 describe("live Devin Bridge integration", () => {
-  (live ? it : it.skip)("identifies a real Claude child, bounds its bridge failure, and verifies cleanup", async (context) => {
+  (live ? it : it.skip)("runs a real Claude parent and Explore child through Devin Bridge and verifies cleanup", async () => {
     const root = await temporaryRoot();
     const home = resolve(root, "home");
     const claudeConfig = resolve(home, ".claude");
@@ -29,13 +29,14 @@ describe("live Devin Bridge integration", () => {
     await mkdir(claudeConfig, { recursive: true });
     await mkdir(project, { recursive: true });
     const nonce = `CLAUDE_ROUTE_OK_${randomUUID().slice(0, 8)}`;
+    const parentNonce = `PARENT_CONFIRMED_${nonce}`;
+    const replayNonce = `CLEANUP_PASSTHROUGH_${randomUUID().slice(0, 8)}`;
     const logs: Array<Record<string, unknown>> = [];
     const captures: UpstreamCapture[] = [];
     const configPath = resolve(root, "router/config.json");
     const config = defaultConfig(root);
     config.harnesses.claude.enabled = true;
     config.harnesses.claude.originalUpstream.baseUrl = BRIDGE_CLAUDE;
-    config.harnesses.claude.mappingTtlMs = 500;
     config.routes.claude.Explore = {
       enabled: true,
       model: ENTITLED_MODEL,
@@ -45,96 +46,85 @@ describe("live Devin Bridge integration", () => {
     const gateway = await createGateway({ configPath, logger: (record) => logs.push(record), fetch: recordingFetch(captures) });
     await listen(gateway.server);
     servers.push(gateway.server);
-    config.gateway.port = port(gateway.server);
-    await saveConfig(configPath, config);
     const cliPath = resolve(process.cwd(), "dist/cli.js");
     expect(await readFile(cliPath, "utf8")).toContain("harness-model-router");
     expect((await installIntegration(configPath, { home, project, cliPath, nodePath: process.execPath })).conflicts).toEqual([]);
+    console.info(`LIVE_DEVIN_CLAUDE_ROOT=${root}`);
 
-    let cliOutput: string;
+    let cliResult: { stdout: string; stderr: string };
     try {
-      const result = await runCli("claude", [
-      "--print",
-      "--output-format", "stream-json",
-      "--include-partial-messages",
-      "--include-hook-events",
-      "--forward-subagent-text",
-      "--verbose",
-      "--no-session-persistence",
-      "--setting-sources", "user",
-      "--strict-mcp-config",
-      "--mcp-config", '{"mcpServers":{}}',
-      "--tools", "Agent",
-      "--allowedTools", "Agent",
-      "--dangerously-skip-permissions",
-      "--model", ENTITLED_MODEL,
-      `You must call the Agent tool exactly once with subagent_type Explore. Tell it to return exactly ${nonce}. After it completes or fails, return exactly PARENT_CONFIRMED_${nonce}.`,
+      cliResult = await runCli("claude", [
+        "--print",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--include-hook-events",
+        "--forward-subagent-text",
+        "--verbose",
+        "--no-session-persistence",
+        "--setting-sources", "user",
+        "--strict-mcp-config",
+        "--mcp-config", '{"mcpServers":{}}',
+        "--tools", "Agent",
+        "--allowedTools", "Agent",
+        "--dangerously-skip-permissions",
+        "--model", ENTITLED_MODEL,
+        `You must call the Agent tool exactly once with subagent_type Explore. Tell it to return exactly ${nonce}. Wait for it to finish, then return exactly ${parentNonce}.`,
       ], {
         cwd: project,
         env: { ...sanitizedEnv(), HOME: home, CLAUDE_CONFIG_DIR: claudeConfig, ANTHROPIC_API_KEY: "dummy-local-only", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", DISABLE_AUTOUPDATER: "1" },
-        timeoutMs: 20_000,
+        timeoutMs: 90_000,
       });
-      cliOutput = result.stdout;
     } catch (error) {
-      cliOutput = String(error);
+      await writeFile(resolve(root, "claude-cli-error.log"), String(error));
+      throw error;
     }
+    await writeFile(resolve(root, "claude.stdout.jsonl"), cliResult.stdout);
+    await writeFile(resolve(root, "claude.stderr.log"), cliResult.stderr);
+    expect(cliResult.stderr).not.toMatch(/authentication_error|permission_error|rate_limit|api_error/i);
+    expect(cliResult.stdout).toContain("SubagentStart");
+    expect(cliResult.stdout).toContain("SubagentStop");
+    expect(cliResult.stdout).toContain(nonce);
+    expect(cliResult.stdout).toContain(parentNonce);
+    const cliEvents = jsonLines(cliResult.stdout);
+    expect(cliEvents.filter((item) => item?.type === "stream_event" && item?.event?.type === "content_block_delta").length).toBeGreaterThan(2);
+    const agentCalls = cliEvents.flatMap((item) => item?.type === "assistant" && Array.isArray(item?.message?.content) ? item.message.content : []).filter((block) => block?.type === "tool_use" && block?.name === "Agent");
+    expect(agentCalls).toHaveLength(1);
+    expect(agentCalls[0]?.input?.subagent_type).toBe("Explore");
 
-    expect(cliOutput).toMatch(/SubagentStart|rate_limit/);
+    const starts = logs.filter((record) => record.event === "claude_hook" && record.action === "start");
+    const stops = logs.filter((record) => record.event === "claude_hook" && record.action === "stop");
+    expect(starts).toHaveLength(1);
+    expect(stops).toHaveLength(1);
+    const start = starts[0];
+    const stop = stops[0];
+    expect(start).toMatchObject({ agentType: "Explore", mappings: 1 });
+    expect(typeof start?.sessionId).toBe("string");
+    expect(typeof start?.agentId).toBe("string");
+    expect(stop).toMatchObject({ sessionId: start?.sessionId, agentId: start?.agentId, agentType: "Explore", mappings: 0 });
     expect(logs.some((record) => record.protocol === "anthropic-messages" && record.routed === false && record.model === ENTITLED_MODEL)).toBe(true);
-    const cliRateLimited = !cliOutput.includes("SubagentStart");
-    if (!cliRateLimited) {
-      expect(cliOutput).toContain(nonce);
-      expect(jsonLines(cliOutput).filter((item) => item?.type === "stream_event" && item?.event?.type === "content_block_delta").length).toBeGreaterThan(2);
-      expect(logs.some((record) => record.protocol === "anthropic-messages" && record.routed === true && record.agentType === "Explore" && record.model === ENTITLED_MODEL)).toBe(true);
-      expect(captures.some((capture) => capture.url.endsWith("/claude/v1/messages?beta=true") && capture.body.model === ENTITLED_MODEL && Array.isArray(capture.body.messages) && JSON.stringify(capture.body.messages).includes(nonce))).toBe(true);
-      if (!cliOutput.includes("SubagentStop")) expect(cliOutput).toMatch(/content policy|api[_ ]error/i);
-    } else expect(cliOutput).toMatch(/429|rate_limit/);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 600));
-    const status = await fetch(`http://127.0.0.1:${config.gateway.port}/__router/status`).then((response) => response.json()) as { mappings: number };
+    expect(logs.filter((record) => record.protocol === "anthropic-messages" && record.routed === true && record.agentType === "Explore" && record.model === ENTITLED_MODEL)).toHaveLength(1);
+
+    const childCapture = captures.find((capture) => capture.headers["x-claude-code-agent-id"] === start?.agentId);
+    expect(childCapture?.url).toMatch(/\/claude\/v1\/messages/);
+    expect(childCapture?.body.model).toBe(ENTITLED_MODEL);
+    expect(JSON.stringify(childCapture?.body.messages)).toContain(nonce);
+    expect(childCapture?.responseStatus).toBe(200);
+    expect(childCapture?.responseContentType).toMatch(/text\/event-stream/);
+    expect(captures.some((capture) => !capture.headers["x-claude-code-agent-id"] && capture.body.model === ENTITLED_MODEL)).toBe(true);
+
+    const status = await routerStatus(config.gateway.port);
     expect(status.mappings).toBe(0);
-    if (cliRateLimited) {
-      context.skip("Devin Bridge Claude model is rate-limited");
-      return;
-    }
-
-    const routedProbe = await fetchWithRateRetry(`http://127.0.0.1:${config.gateway.port}/claude/v1/messages`, {
+    const replay = await fetch(`http://127.0.0.1:${config.gateway.port}/claude/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "dummy-local-only", "x-claude-code-session-id": "cleanup-session", "x-claude-code-agent-id": "cleanup-agent" },
-      body: JSON.stringify({ model: ENTITLED_MODEL, max_tokens: 32, stream: true, messages: [{ role: "user", content: "Reply with exactly ROUTED_CLEANUP_OK" }] }),
-    }, () => claudeHook(config.gateway.port, "start", "cleanup-session", "cleanup-agent", "Explore"));
-    expect(routedProbe.ok).toBe(true);
-    const routedProbeText = await routedProbe.text();
-    expect(logs.at(-1)?.routed).toBe(true);
-    await claudeHook(config.gateway.port, "stop", "cleanup-session", "cleanup-agent", "Explore");
-    const replay = await fetchWithRateRetry(`http://127.0.0.1:${config.gateway.port}/claude/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "dummy-local-only", "x-claude-code-session-id": "cleanup-session", "x-claude-code-agent-id": "cleanup-agent" },
-      body: JSON.stringify({ model: ENTITLED_MODEL, max_tokens: 32, stream: false, messages: [{ role: "user", content: "Reply with exactly CLEANUP_PASSTHROUGH_OK" }] }),
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "dummy-local-only", "x-claude-code-session-id": String(start?.sessionId), "x-claude-code-agent-id": String(start?.agentId) },
+      body: JSON.stringify({ model: ENTITLED_MODEL, max_tokens: 32, stream: true, messages: [{ role: "user", content: `Reply with exactly ${replayNonce}` }] }),
     });
+    const replayText = await replay.text();
+    if (!replay.ok) throw new Error(`Devin Bridge cleanup replay returned ${replay.status}: ${replayText}`);
     expect(logs.at(-1)?.routed).toBe(false);
-    if (replay.status === 429) {
-      context.skip("Devin Bridge Claude model is rate-limited");
-      return;
-    }
-    expect(replay.ok).toBe(true);
-    if (/rate_limit/i.test(routedProbeText)) {
-      context.skip("Devin Bridge Claude model is rate-limited");
-      return;
-    }
-    expect(anthropicTextDeltas(routedProbeText)).toContain("ROUTED_CLEANUP_OK");
-
-    config.routes.claude.Explore!.model = DENIED_MODEL;
-    await saveConfig(configPath, config);
-    await claudeHook(config.gateway.port, "start", "denied-session", "denied-agent", "Explore");
-    const denied = await fetch(`http://127.0.0.1:${config.gateway.port}/claude/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "dummy-local-only", "x-claude-code-session-id": "denied-session", "x-claude-code-agent-id": "denied-agent" },
-      body: JSON.stringify({ model: ENTITLED_MODEL, max_tokens: 16, stream: false, messages: [{ role: "user", content: "denied route probe" }] }),
-    });
-    expect(denied.ok).toBe(false);
-    expect(await denied.text()).toMatch(/not entitled|permission_error/i);
-    await claudeHook(config.gateway.port, "stop", "denied-session", "denied-agent", "Explore");
-    expect((await fetch(`http://127.0.0.1:${config.gateway.port}/__router/status`).then((response) => response.json()) as { mappings: number }).mappings).toBe(0);
+    expect(anthropicTextDeltas(replayText)).toContain(replayNonce);
+    expect((await routerStatus(config.gateway.port)).mappings).toBe(0);
+    await writeJson(resolve(root, "combined-evidence.json"), { root, home, claudeConfig, project, configPath, nonce, parentNonce, replayNonce, status, start, stop, logs, captures });
   }, 90_000);
 
   (live ? it : it.skip)("passes main Codex traffic and routes a real hidden-alias session with V1 metadata", async (context) => {
@@ -179,8 +169,6 @@ describe("live Devin Bridge integration", () => {
     const gateway = await createGateway({ configPath, logger: (record) => logs.push(record), fetch: recordingFetch(captures) });
     await listen(gateway.server);
     servers.push(gateway.server);
-    config.gateway.port = port(gateway.server);
-    await saveConfig(configPath, config);
     await writeFile(resolve(codexHome, "config.toml"), `model = ${JSON.stringify(ENTITLED_MODEL)}\nmodel_provider = "original"\nmodel_reasoning_effort = "low"\n\n[model_providers.original]\nname = "Devin Bridge"\nbase_url = ${JSON.stringify(BRIDGE_OPENAI)}\nenv_key = "DEVIN_BRIDGE_TEST_KEY"\nwire_api = "responses"\n\n[features]\nmulti_agent = true\nmulti_agent_v2 = false\nremote_plugin = false\nplugins = false\napps = false\n`);
     const cliPath = resolve(process.cwd(), "dist/cli.js");
     expect((await installIntegration(configPath, { home, project, cliPath, nodePath: process.execPath })).conflicts).toEqual([]);
@@ -252,8 +240,6 @@ describe("live Devin Bridge integration", () => {
     const gateway = await createGateway({ configPath, logger: (record) => logs.push(record) });
     await listen(gateway.server);
     servers.push(gateway.server);
-    config.gateway.port = port(gateway.server);
-    await saveConfig(configPath, config);
 
     await claudeHook(config.gateway.port, "start", "entitlement-session", "entitlement-agent", "Explore");
     const claude = await fetch(`http://127.0.0.1:${config.gateway.port}/claude/v1/messages`, {
@@ -295,9 +281,18 @@ function sanitizedEnv(): NodeJS.ProcessEnv {
 function recordingFetch(captures: UpstreamCapture[]): typeof fetch {
   return async (input, init) => {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) as Record<string, any> : {};
-    captures.push({ url: String(input), body });
-    return fetch(input, init);
+    const headers = Object.fromEntries(new Headers(init?.headers).entries());
+    const capture: UpstreamCapture = { url: String(input), body, headers };
+    captures.push(capture);
+    const response = await fetch(input, init);
+    capture.responseStatus = response.status;
+    capture.responseContentType = response.headers.get("content-type") ?? undefined;
+    return response;
   };
+}
+
+async function routerStatus(portNumber: number): Promise<{ mappings: number }> {
+  return fetch(`http://127.0.0.1:${portNumber}/__router/status`).then((response) => response.json()) as Promise<{ mappings: number }>;
 }
 
 function jsonLines(value: string): any[] {
@@ -313,26 +308,8 @@ function anthropicTextDeltas(value: string): string {
   }).join("");
 }
 
-async function fetchWithRateRetry(input: string, init: RequestInit, beforeAttempt?: () => Promise<void>): Promise<Response> {
-  await beforeAttempt?.();
-  let response = await fetch(input, init);
-  for (let attempt = 1; response.status === 429 && attempt <= 5; attempt += 1) {
-    await response.body?.cancel();
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, attempt * 1_000));
-    await beforeAttempt?.();
-    response = await fetch(input, init);
-  }
-  return response;
-}
-
 async function listen(server: Server): Promise<void> {
-  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
-}
-
-function port(server: Server): number {
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("gateway address missing");
-  return address.port;
+  await new Promise<void>((resolvePromise) => server.listen(9476, "127.0.0.1", resolvePromise));
 }
 
 async function runCli(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<{ stdout: string; stderr: string }> {

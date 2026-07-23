@@ -1,4 +1,5 @@
 import type { RouterConfig } from "./types.js";
+import { routeUpstream } from "./config.js";
 
 export interface ModelCatalogEntry {
   slug: string;
@@ -16,9 +17,10 @@ export interface ModelCatalog {
 export function overlayCatalog(source: ModelCatalog, config: RouterConfig): ModelCatalog {
   const models = source.models.map((model) => structuredClone(model));
   const bySlug = new Map(models.map((model) => [model.slug, model]));
-  const enabledV1 = Object.values(config.routes.codex).filter((route) => route.enabled && route.requiredMultiAgentVersion === "v1");
+  const enabledV1 = Object.values(config.routes.codex).filter((route) => route.enabled && routeUpstream(config, "codex", route) && route.requiredMultiAgentVersion === "v1");
   const template = models[0];
   for (const route of Object.values(config.routes.codex)) {
+    if (!routeUpstream(config, "codex", route)) continue;
     if (!route.alias) continue;
     const persistent = Object.values(config.preserved.customCodexAgents).some((entry) => entry.alias === route.alias);
     if (!route.enabled && !persistent) continue;

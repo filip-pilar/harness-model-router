@@ -13,11 +13,18 @@ export interface Upstream {
   authorization?: AuthorizationReference;
 }
 
+export interface Destination {
+  name: string;
+  openaiBaseUrl?: string;
+  anthropicBaseUrl?: string;
+}
+
 export interface Route {
   enabled: boolean;
   alias?: string;
   model: string;
-  upstream: Upstream;
+  destination: string;
+  authorization?: AuthorizationReference;
   requiredMultiAgentVersion?: "v1";
 }
 
@@ -53,13 +60,14 @@ export interface PreservedCustomAgent {
 }
 
 export interface RouterConfig {
-  version: 1;
+  version: 2;
   gateway: {
     enabled: boolean;
     host: string;
     port: number;
     maxBodyBytes: number;
   };
+  destinations: Record<string, Destination>;
   harnesses: {
     claude: ClaudeHarnessConfig;
     codex: CodexHarnessConfig;
@@ -77,7 +85,7 @@ export interface RouteDecision {
   harness: Harness;
   agentType?: string;
   routed: boolean;
-  reason: "main" | "unknown" | "disabled" | "enabled" | "persistent-disabled";
+  reason: "main" | "unknown" | "disabled" | "broken" | "enabled" | "persistent-disabled";
   wireModel: string;
   upstream: Upstream;
   internalAlias?: string;

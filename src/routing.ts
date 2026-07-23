@@ -1,4 +1,4 @@
-import { routeFor } from "./config.js";
+import { routeFor, routeUpstream } from "./config.js";
 import type { RouteDecision, RouterConfig } from "./types.js";
 
 export function decideClaudeRoute(config: RouterConfig, originalModel: string, agentType?: string): RouteDecision {
@@ -7,7 +7,9 @@ export function decideClaudeRoute(config: RouterConfig, originalModel: string, a
   const route = routeFor(config, "claude", agentType);
   if (!route) return { harness: "claude", agentType, routed: false, reason: "unknown", wireModel: originalModel, upstream: original };
   if (!route.enabled || !config.harnesses.claude.enabled) return { harness: "claude", agentType, routed: false, reason: "disabled", wireModel: originalModel, upstream: original };
-  return { harness: "claude", agentType, routed: true, reason: "enabled", wireModel: route.model, upstream: route.upstream };
+  const upstream = routeUpstream(config, "claude", route);
+  if (!upstream) return { harness: "claude", agentType, routed: false, reason: "broken", wireModel: originalModel, upstream: original };
+  return { harness: "claude", agentType, routed: true, reason: "enabled", wireModel: route.model, upstream };
 }
 
 export function decideCodexRoute(config: RouterConfig, requestedModel: string): RouteDecision {
@@ -17,7 +19,11 @@ export function decideCodexRoute(config: RouterConfig, requestedModel: string): 
   const [agentType, route] = match;
   const preserved = Object.values(config.preserved.customCodexAgents).find((entry) => entry.alias === requestedModel && entry.agentType === agentType);
   if (route.enabled && config.harnesses.codex.enabled) {
-    return { harness: "codex", agentType, routed: true, reason: "enabled", wireModel: route.model, upstream: route.upstream, internalAlias: requestedModel };
+    const upstream = routeUpstream(config, "codex", route);
+    if (!upstream) return preserved
+      ? { harness: "codex", agentType, routed: false, reason: "persistent-disabled", wireModel: preserved.originalModel, upstream: original, internalAlias: requestedModel }
+      : { harness: "codex", agentType, routed: false, reason: "broken", wireModel: requestedModel, upstream: original, internalAlias: requestedModel };
+    return { harness: "codex", agentType, routed: true, reason: "enabled", wireModel: route.model, upstream, internalAlias: requestedModel };
   }
   if (preserved) {
     return { harness: "codex", agentType, routed: false, reason: "persistent-disabled", wireModel: preserved.originalModel, upstream: original, internalAlias: requestedModel };
@@ -30,7 +36,7 @@ export function codexHookOutput(config: RouterConfig, toolName: string, input: R
   const agentType = input.agent_type;
   if (typeof agentType !== "string") return undefined;
   const route = config.routes.codex[agentType];
-  if (!config.harnesses.codex.enabled || !route?.enabled || !route.alias) return undefined;
+  if (!config.harnesses.codex.enabled || !route?.enabled || !route.alias || !routeUpstream(config, "codex", route)) return undefined;
   return {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
